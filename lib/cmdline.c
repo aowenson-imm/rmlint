@@ -1430,6 +1430,7 @@ bool rm_cmd_parse_args(int argc, char **argv, RmSession *session) {
         {"newer-than"       , 'N' , 0        , G_OPTION_ARG_CALLBACK , FUNC(timestamp)      , _("Newer than timestamp")                 , "STAMP"}               ,
         {"config"           , 'c' , 0        , G_OPTION_ARG_CALLBACK , FUNC(config)         , _("Configure a formatter")                , "FMT:K[=V]"}           ,
         {"xattr"            , 'C' , EMPTY    , G_OPTION_ARG_CALLBACK , FUNC(xattr)          , _("Enable xattr based caching")           , ""}                    ,
+        {"timeout"          , 0   , 0        , G_OPTION_ARG_INT      , &cfg->trav_timeout   , _("Skip slow/dead folder after timeout ms") , "N"}                 ,
 
         /* Non-trivial switches */
         {"progress" , 'g' , EMPTY , G_OPTION_ARG_CALLBACK , FUNC(progress) , _("Enable progressbar")                   , NULL} ,
