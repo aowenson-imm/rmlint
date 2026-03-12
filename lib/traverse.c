@@ -578,7 +578,7 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
     if(use_worker) {
         if(traversal_timed_out) {
             rm_log_warning_line(
-                _("Traversal timed out after %dms while reading %s; skipping this folder."),
+                _("Traversal timed out after %ds while reading %s; skipping this folder."),
                 cfg->trav_timeout, traversal_err_path);
         } else if(traversal_failed && !rm_session_was_aborted()) {
             rm_log_warning_line(_("'%s': fts_read failed on %s"),

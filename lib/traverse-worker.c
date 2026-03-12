@@ -363,19 +363,19 @@ bool rm_trav_worker_start_path(RmTravWorker *worker, const char *path,
 /* Request next traversal entry, optionally timing out while waiting for worker I/O. */
 RmTravWorkerReadResult rm_trav_worker_next(RmTravWorker *worker,
                                            RmTravWorkerAction action,
-                                           gint timeout_ms,
+                                           gint timeout_s,
                                            RmTravWorkerResp *resp) {
     RmTravWorkerCmdWire cmd = {.type = RM_TRAV_WORKER_CMD_NEXT, .action = action};
     if(!rm_trav_worker_send_cmd(worker, &cmd, NULL)) {
         return RM_TRAV_WORKER_READ_IOFAIL;
     }
 
-    if(timeout_ms > 0) {
+    if(timeout_s > 0) {
         /* Timeout is applied while waiting for worker I/O, not while processing an entry. */
         struct pollfd pfd = {.fd = worker->from_worker_fd, .events = POLLIN, .revents = 0};
         int rc;
         do {
-            rc = poll(&pfd, 1, timeout_ms);
+            rc = poll(&pfd, 1, timeout_s*1000);
         } while(rc < 0 && errno == EINTR);
 
         if(rc == 0) {
