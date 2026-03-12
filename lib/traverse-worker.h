@@ -47,7 +47,7 @@ bool rm_trav_worker_ensure(RmTravWorker *worker);
 bool rm_trav_worker_start_path(RmTravWorker *worker, const char *path, int fts_flags);
 RmTravWorkerReadResult rm_trav_worker_next(RmTravWorker *worker,
                                            RmTravWorkerAction action,
-                                           gint timeout_ms,
+                                           gint timeout_s,
                                            RmTravWorkerResp *resp);
 void rm_trav_worker_kill(RmTravWorker *worker);
 void rm_trav_worker_resp_clear(RmTravWorkerResp *resp);

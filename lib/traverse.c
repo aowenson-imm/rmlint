@@ -297,11 +297,12 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
     if(rmpath->treat_as_single_vol) {
         rm_log_debug_line("Treating files under %s as a single volume", rmpath->path);
     }
-    /* Keep legacy in-process traversal when timeout is not requested. */
-    bool use_worker = cfg->trav_timeout > 0;
+
     FTS *ftsp = NULL;
+
+    /* Worker-mode variables */
+    bool use_worker = cfg->trav_timeout > 0;
     RmTravWorker *worker = NULL;
-    /* Worker mode applies fts_set() to the previously returned entry on the next read. */
     RmTravWorkerAction action = RM_TRAV_WORKER_ACTION_NONE;
     bool traversal_timed_out = false;
     bool traversal_failed = false;
@@ -310,6 +311,7 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
     char *last_seen_path = NULL;
 
     if(use_worker) {
+        /* Initialise worker-mode */
         worker = rm_trav_worker_get();
         if(!rm_trav_worker_ensure(worker)) {
             rm_log_error_line("Failed to start traverse worker process");

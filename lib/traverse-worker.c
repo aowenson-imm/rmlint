@@ -72,6 +72,27 @@ static bool rm_trav_read_full(int fd, void *buf, size_t size) {
     return true;
 }
 
+/* Poll once with an overall timeout budget that survives EINTR retries. */
+static int rm_trav_poll_with_budget(int fd, gint timeout_s) {
+    gint64 deadline_us = g_get_monotonic_time() + ((gint64)timeout_s*1000000);
+
+    while(true) {
+        gint64 now_us = g_get_monotonic_time();
+        gint64 remaining_us = deadline_us - now_us;
+        if(remaining_us <= 0) {
+            return 0;
+        }
+
+        int remaining_ms = (int)((remaining_us + 999) / 1000);
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        int rc = poll(&pfd, 1, remaining_ms);
+        if(rc < 0 && errno == EINTR) {
+            continue;
+        }
+        return rc;
+    }
+}
+
 /* Release per-response heap fields so response buffers can be safely reused. */
 void rm_trav_worker_resp_clear(RmTravWorkerResp *resp) {
     g_free(resp->path);
@@ -348,9 +369,18 @@ bool rm_trav_worker_start_path(RmTravWorker *worker, const char *path,
 
     /* Probe only for immediate startup failures; keep the common path non-blocking. */
     struct pollfd pfd = {.fd = worker->from_worker_fd, .events = POLLIN, .revents = 0};
-    int rc = poll(&pfd, 1, 0);
-    if(rc <= 0) {
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 0);
+    } while(rc < 0 && errno == EINTR);
+
+    if(rc == 0) {
+        // timeout
         return true;
+    }
+    if(rc < 0) {
+        // error
+        return false;
     }
 
     RmTravWorkerResp resp = {0};
@@ -360,7 +390,7 @@ bool rm_trav_worker_start_path(RmTravWorker *worker, const char *path,
     return ok;
 }
 
-/* Request next traversal entry, optionally timing out while waiting for worker I/O. */
+/* Request next traversal entry with timeout while waiting for worker I/O. */
 RmTravWorkerReadResult rm_trav_worker_next(RmTravWorker *worker,
                                            RmTravWorkerAction action,
                                            gint timeout_s,
@@ -370,20 +400,13 @@ RmTravWorkerReadResult rm_trav_worker_next(RmTravWorker *worker,
         return RM_TRAV_WORKER_READ_IOFAIL;
     }
 
-    if(timeout_s > 0) {
-        /* Timeout is applied while waiting for worker I/O, not while processing an entry. */
-        struct pollfd pfd = {.fd = worker->from_worker_fd, .events = POLLIN, .revents = 0};
-        int rc;
-        do {
-            rc = poll(&pfd, 1, timeout_s*1000);
-        } while(rc < 0 && errno == EINTR);
-
-        if(rc == 0) {
-            return RM_TRAV_WORKER_READ_TIMEOUT;
-        }
-        if(rc < 0) {
-            return RM_TRAV_WORKER_READ_IOFAIL;
-        }
+    /* Timeout is applied while waiting for worker I/O, not while processing an entry. */
+    int rc = rm_trav_poll_with_budget(worker->from_worker_fd, timeout_s*1000);
+    if(rc == 0) {
+        return RM_TRAV_WORKER_READ_TIMEOUT;
+    }
+    if(rc < 0) {
+        return RM_TRAV_WORKER_READ_IOFAIL;
     }
 
     if(!rm_trav_worker_read_resp(worker, resp)) {
