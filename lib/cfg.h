@@ -100,6 +100,7 @@ typedef struct RmCfg {
     gdouble mtime_window;
     gint depth;
     gint verbosity;
+    gint trav_timeout;
 
     gboolean clamp_is_used;
     gdouble skip_start_factor;

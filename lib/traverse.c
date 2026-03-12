@@ -36,6 +36,7 @@
 #include "formats.h"
 #include "md-scheduler.h"
 #include "preprocess.h"
+#include "traverse-worker.h"
 #include "utilities.h"
 #include "xattr.h"
 
@@ -236,7 +237,7 @@ static bool rm_traverse_is_hidden(RmCfg *cfg, const char *basename, char *hierar
     rm_traverse_file(                                                                   \
         trav_session, (RmStat *)stat_buf, p->fts_path, is_prefd, path_index, lint_type, \
         is_symlink,                                                                     \
-        rm_traverse_is_hidden(cfg, p->fts_name, is_hidden, p->fts_level + 1),           \
+        rm_traverse_is_hidden(cfg, entry_name, is_hidden, p->fts_level + 1),            \
         rmpath->treat_as_single_vol, p->fts_level);
 
 #if RM_PLATFORM_32 && HAVE_STAT64
@@ -298,18 +299,49 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
         rm_log_debug_line("Treating files under %s as a single volume", rmpath->path);
     }
 
-    FTS *ftsp = fts_open((const char *const[2]){rmpath->path, NULL}, fts_flags, NULL);
+    FTS *ftsp = NULL;
+    dev_t start_dev;
+    FTSENT *p = NULL;
 
-    if(ftsp == NULL) {
-        rm_log_error_line("fts_open() == NULL");
-        goto done;
-    }
+    /* Worker-mode variables */
+    bool use_worker = cfg->trav_timeout > 0;
+    RmTravWorker *worker = NULL;
+    RmTravWorkerAction action = RM_TRAV_WORKER_ACTION_NONE;
+    bool traversal_timed_out = false;
+    bool traversal_failed = false;
+    int traversal_errno = 0;
+    const char *traversal_err_path = rmpath->path;
+    char *last_seen_path = NULL;
 
-    FTSENT *p, *chp;
-    chp = fts_children(ftsp, 0);
-    if(chp == NULL) {
-        rm_log_warning_line("fts_children() == NULL");
-        goto done;
+    if(use_worker) {
+        /* Initialise worker-mode */
+        worker = rm_trav_worker_get();
+        if(!rm_trav_worker_ensure(worker)) {
+            rm_log_error_line("Failed to start traverse worker process");
+            goto done;
+        }
+        if(!rm_trav_worker_start_path(worker, rmpath->path, fts_flags)) {
+            rm_log_error_line("Failed to initialize traversal for %s", rmpath->path);
+            rm_trav_worker_kill(worker);
+            goto done;
+        }
+        if(!rm_trav_worker_get_dev(worker, cfg->trav_timeout, &start_dev)) {
+            rm_log_warning_line("fts_children() == NULL");
+            rm_trav_worker_kill(worker);
+            goto done;
+        }
+    } else {
+        ftsp = fts_open((const char *const[2]){rmpath->path, NULL}, fts_flags, NULL);
+        if(ftsp == NULL) {
+            rm_log_error_line("fts_open() == NULL");
+            goto done;
+        }
+        FTSENT *chp = fts_children(ftsp, 0);
+        if(chp == NULL) {
+            rm_log_warning_line("fts_children() == NULL");
+            goto done;
+        }
+        start_dev = chp->fts_dev;
     }
 
     /* start main processing */
@@ -322,13 +354,79 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
     memset(is_emptydir, 0, sizeof(is_emptydir) - 1);
     memset(is_hidden, 0, sizeof(is_hidden) - 1);
 
-    while(!rm_session_was_aborted() && (p = fts_read(ftsp)) != NULL) {
+    /* Single traversal loop: only entry transport differs between modes. */
+    while(!rm_session_was_aborted()) {
+        const char *entry_name = NULL;
+        RmTravWorkerResp resp = {0};
+        FTSENT worker_entry = {0};
+
+        if(use_worker) {
+            /* Worker mode fetches serialized entries and can time out on IPC wait. */
+            RmTravWorkerReadResult read_state =
+                rm_trav_worker_next(worker, action, cfg->trav_timeout, &resp);
+            /* Consume deferred control action so later iterations start from NONE. */
+            action = RM_TRAV_WORKER_ACTION_NONE;
+
+            if(read_state == RM_TRAV_WORKER_READ_TIMEOUT) {
+                traversal_timed_out = true;
+                traversal_err_path = last_seen_path ? last_seen_path : rmpath->path;
+                rm_trav_worker_kill(worker);
+                break;
+            }
+            if(read_state == RM_TRAV_WORKER_READ_IOFAIL) {
+                traversal_failed = true;
+                rm_log_error_line("Traversal IPC failed for %s", rmpath->path);
+                rm_trav_worker_kill(worker);
+                break;
+            }
+            if(read_state == RM_TRAV_WORKER_READ_ERROR) {
+                traversal_failed = true;
+                traversal_errno = resp.wire.err;
+                traversal_err_path = resp.path ? resp.path : rmpath->path;
+                rm_trav_worker_resp_clear(&resp);
+                break;
+            }
+            if(read_state == RM_TRAV_WORKER_READ_EOF) {
+                rm_trav_worker_resp_clear(&resp);
+                break;
+            }
+
+            worker_entry.fts_info = resp.wire.fts_info;
+            worker_entry.fts_level = resp.wire.fts_level;
+            worker_entry.fts_errno = resp.wire.fts_errno;
+            worker_entry.fts_dev = (dev_t)resp.wire.fts_dev;
+            /* Borrow strings/stat from resp for this iteration, then free via clear(). */
+            worker_entry.fts_path = resp.path;
+            worker_entry.fts_statp = resp.wire.has_stat ? &resp.wire.stat_buf : NULL;
+            // entry_name = resp.name ? resp.name : "";
+            entry_name = resp.name;
+            p = &worker_entry;
+        } else {
+            /* Legacy mode keeps direct fts_read behavior unchanged. */
+            errno = 0;
+            p = fts_read(ftsp);
+            if(p == NULL) {
+                traversal_errno = errno;
+                traversal_err_path = ftsp->fts_path;
+                break;
+            }
+            entry_name = p->fts_name;
+        }
+
+        if(p->fts_path != NULL) {
+            g_free(last_seen_path);
+            last_seen_path = g_strdup(p->fts_path);
+        }
         /* check for hidden file or folder */
-        if(cfg->ignore_hidden && p->fts_level > 0 && p->fts_name[0] == '.') {
+        if(cfg->ignore_hidden && p->fts_level > 0 && entry_name[0] == '.') {
             /* ignoring hidden folders*/
 
             if(p->fts_info == FTS_D) {
-                fts_set(ftsp, p, FTS_SKIP); /* do not recurse */
+                if(use_worker) {
+                    action = RM_TRAV_WORKER_ACTION_SKIP;
+                } else {
+                    fts_set(ftsp, p, FTS_SKIP); /* do not recurse */
+                }
                 g_atomic_int_inc(&trav_session->session->ignored_folders);
             } else {
                 g_atomic_int_inc(&trav_session->session->ignored_files);
@@ -341,13 +439,21 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
             case FTS_D: /* preorder directory */
                 if(cfg->depth != 0 && p->fts_level >= cfg->depth) {
                     /* continuing into folder would exceed maxdepth*/
-                    fts_set(ftsp, p, FTS_SKIP);  /* do not recurse */
+                    if(use_worker) {
+                        action = RM_TRAV_WORKER_ACTION_SKIP;
+                    } else {
+                        fts_set(ftsp, p, FTS_SKIP); /* do not recurse */
+                    }
                     clear_emptydir_flags = true; /* flag current dir as not empty */
                     rm_log_debug_line("Not descending into %s because max depth reached",
                                       p->fts_path);
-                } else if(!(cfg->crossdev) && p->fts_dev != chp->fts_dev) {
-                    /* continuing into folder would cross file systems*/
-                    fts_set(ftsp, p, FTS_SKIP);  /* do not recurse */
+                } else if(!(cfg->crossdev) && p->fts_dev != start_dev) {
+                    /* continuing into folder would cross file systems */
+                    if(use_worker) {
+                        action = RM_TRAV_WORKER_ACTION_SKIP;
+                    } else {
+                        fts_set(ftsp, p, FTS_SKIP); /* do not recurse */
+                    }
                     clear_emptydir_flags = true; /*flag current dir as not empty*/
                     rm_log_info(
                         "Not descending into %s because it is a different filesystem\n",
@@ -356,7 +462,7 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
                     /* recurse dir; assume empty until proven otherwise */
                     is_emptydir[p->fts_level + 1] = 1;
                     is_hidden[p->fts_level + 1] =
-                        is_hidden[p->fts_level] | (p->fts_name[0] == '.');
+                        is_hidden[p->fts_level] | (entry_name[0] == '.');
                     have_open_emptydirs = true;
                 }
                 break;
@@ -405,7 +511,7 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
                      */
                     rm_traverse_file(trav_session, &stat_buf, p->fts_path, is_prefd,
                                      path_index, RM_LINT_TYPE_UNKNOWN, false,
-                                     rm_traverse_is_hidden(cfg, p->fts_name, is_hidden,
+                                     rm_traverse_is_hidden(cfg, entry_name, is_hidden,
                                                            p->fts_level + 1),
                                      rmpath->treat_as_single_vol, p->fts_level);
                     rm_log_info_line(_("Added big file %s"), p->fts_path);
@@ -433,7 +539,11 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
                     }
                 } else {
                     next_is_symlink = true;
-                    fts_set(ftsp, p, FTS_FOLLOW); /* do recurse */
+                    if(use_worker) {
+                        action = RM_TRAV_WORKER_ACTION_FOLLOW;
+                    } else {
+                        fts_set(ftsp, p, FTS_FOLLOW); /* do recurse */
+                    }
                 }
                 break;
             case FTS_NSOK:    /* no rm_sys_stat(2) requested */
@@ -464,16 +574,33 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
             /* current dir may not be empty; by association, all open dirs are non-empty
              */
         }
+
+        if(use_worker) {
+            rm_trav_worker_resp_clear(&resp);
+        }
     }
 
-    if(errno != 0 && !rm_session_was_aborted()) {
-        rm_log_error_line(_("'%s': fts_read failed on %s"), g_strerror(errno),
-                          ftsp->fts_path);
+    if(use_worker) {
+        if(traversal_timed_out) {
+            rm_log_warning_line(
+                _("Traversal timed out after %ds while reading %s; skipping this folder."),
+                cfg->trav_timeout, traversal_err_path);
+        } else if(traversal_failed && !rm_session_was_aborted()) {
+            rm_log_warning_line(_("'%s': fts_read failed on %s"),
+                                g_strerror(traversal_errno),
+                                traversal_err_path);
+        }
+    } else if(traversal_errno != 0 && !rm_session_was_aborted()) {
+        rm_log_error_line(_("'%s': fts_read failed on %s"), g_strerror(traversal_errno),
+                          traversal_err_path);
     }
 
 #undef ADD_FILE
 
-    fts_close(ftsp);
+    if(ftsp != NULL) {
+        fts_close(ftsp);
+    }
+    g_free(last_seen_path);
 
     rm_fmt_set_state(session->formats, RM_PROGRESS_STATE_TRAVERSE);
 
