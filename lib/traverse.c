@@ -398,7 +398,6 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
             /* Borrow strings/stat from resp for this iteration, then free via clear(). */
             worker_entry.fts_path = resp.path;
             worker_entry.fts_statp = resp.wire.has_stat ? &resp.wire.stat_buf : NULL;
-            // entry_name = resp.name ? resp.name : "";
             entry_name = resp.name;
             p = &worker_entry;
         } else {
@@ -443,7 +442,11 @@ static void rm_traverse_directory(RmTravBuffer *buffer, RmTravSession *trav_sess
                         /* skip folder if size < minsize
                          * In some filesystems e.g. Ceph, folder size = 
                          * recursive sum of all contents. */
-                        fts_set(ftsp, p, FTS_SKIP);
+                        if(use_worker) {
+                            action = RM_TRAV_WORKER_ACTION_SKIP;
+                        } else {
+                            fts_set(ftsp, p, FTS_SKIP);
+                        }
                         g_atomic_int_inc(&trav_session->session->ignored_folders);
                         clear_emptydir_flags = true;
                         rm_log_debug_line(
